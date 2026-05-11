@@ -1,0 +1,176 @@
+name: Hugging Face Model Downloader - Part 1 (00-15)
+
+on:
+  workflow_dispatch:
+    inputs:
+      model_url:
+        description: 'آدرس ریپازیتوری مدل'
+        required: true
+        type: string
+      filename:
+        description: 'نام فایل مدل'
+        required: true
+        type: string
+      use_auth:
+        description: 'نیاز به احراز هویت دارد؟'
+        required: true
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+      output_folder:
+        description: 'پوشه خروجی'
+        required: false
+        type: string
+        default: 'downloads/huggingface'
+
+jobs:
+  download-and-push-part1:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    
+    - name: Setup Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
+    
+    - name: Install dependencies
+      run: |
+        pip install huggingface-hub requests tqdm
+    
+    - name: Download model
+      env:
+        HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      run: |
+        import os
+        import re
+        from huggingface_hub import hf_hub_download, login
+        
+        model_url = "${{ github.event.inputs.model_url }}"
+        filename = "${{ github.event.inputs.filename }}"
+        use_auth = "${{ github.event.inputs.use_auth }}" == "true"
+        output_folder = "${{ github.event.inputs.output_folder }}"
+        
+        # Extract repo_id from URL
+        repo_id = model_url.replace('https://huggingface.co/', '').replace('http://huggingface.co/', '')
+        repo_id = repo_id.rstrip('/')
+        repo_id = re.sub(r'/(resolve|blob)/main.*$', '', repo_id)
+        
+        print(f"Repository: {repo_id}")
+        print(f"File: {filename}")
+        
+        os.makedirs(output_folder, exist_ok=True)
+        
+        token = os.environ.get('HF_TOKEN') if use_auth else None
+        if use_auth and token:
+            login(token=token, add_to_git_credential=False)
+            print("✓ Logged in")
+        
+        downloaded_path = hf_hub_download(
+            repo_id=repo_id,
+            filename=filename,
+            token=token,
+            local_dir=output_folder,
+            local_dir_use_symlinks=False
+        )
+        
+        print(f"✓ Downloaded: {downloaded_path}")
+        
+      shell: python
+    
+    - name: Split file and keep only first 16 parts
+      run: |
+        cd "${{ github.event.inputs.output_folder }}"
+        
+        FILE="${{ github.event.inputs.filename }}"
+        
+        # Split into 95MB parts
+        split -b 95M -d "$FILE" "${FILE}.part_"
+        
+        # Remove original file
+        rm "$FILE"
+        
+        # Create directory for part1
+        mkdir -p part1
+        
+        # Move only parts 00 to 15 to part1 directory
+        for i in $(seq -f "%02g" 0 15); do
+          if [ -f "${FILE}.part_$i" ]; then
+            mv "${FILE}.part_$i" "part1/"
+            echo "Moved part_$i to part1/"
+          fi
+        done
+        
+        # Create manifest for part1
+        cat > part1/MANIFEST_PART1.md << EOF
+        # Part 1 Download (Parts 00-15)
+        - Model: ${{ github.event.inputs.model_url }}
+        - File: ${{ github.event.inputs.filename }}
+        - Parts: 00 to 15
+        - Total parts in this batch: $(ls part1/*.part_* | wc -l)
+        
+        ## How to reassemble:
+        1. Download all parts from part1/ and part2/
+        2. Run: cat ${FILE}.part_* > ${FILE}
+        EOF
+        
+        # Create reassemble script
+        cat > reassemble_complete.sh << 'EOF'
+        #!/bin/bash
+        echo "Reassembling complete model..."
+        
+        # Get base filename
+        BASENAME=$(ls part1/*.part_00 2>/dev/null | head -1 | sed 's/\.part_00$//' | xargs basename)
+        
+        # Combine all parts from both directories
+        cat part1/${BASENAME}.part_* part2/${BASENAME}.part_* > ${BASENAME}
+        
+        # Verify with md5 if exists
+        if [ -f "${BASENAME}.md5" ]; then
+          if md5sum -c "${BASENAME}.md5" 2>/dev/null; then
+            echo "✓ Verification successful!"
+          else
+            echo "✗ Verification failed!"
+          fi
+        fi
+        
+        echo "Done! Output file: ${BASENAME}"
+        EOF
+        
+        chmod +x reassemble_complete.sh
+        mv reassemble_complete.sh part1/
+        
+        echo "✓ Part 1 prepared with parts 00-15"
+        echo "Files in part1:"
+        ls -lh part1/
+        
+      shell: bash
+    
+    - name: Commit and push part 1 only
+      run: |
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.reply.github.com"
+        
+        # Add only part1 directory
+        git add "${{ github.event.inputs.output_folder }}/part1"
+        
+        if git diff --staged --quiet; then
+          echo "No changes to commit"
+        else
+          git commit -m "Part 1/2: ${{ github.event.inputs.filename }} (parts 00-15) [skip ci]"
+          git push origin HEAD:main
+          echo "✓ Part 1 pushed successfully"
+        fi
+        
+        # Also push the original directory structure
+        git add "${{ github.event.inputs.output_folder }}/reassemble_complete.sh" 2>/dev/null || true
+        git commit -m "Add reassemble script [skip ci]" 2>/dev/null || true
+        git push origin HEAD:main 2>/dev/null || true

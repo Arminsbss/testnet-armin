@@ -1,0 +1,190 @@
+name: Hugging Face Model Downloader - Part 2 (16-31)
+
+on:
+  workflow_dispatch:
+    inputs:
+      model_url:
+        description: 'آدرس ریپازیتوری مدل (همان آدرس قبلی)'
+        required: true
+        type: string
+      filename:
+        description: 'نام فایل مدل (همان نام قبلی)'
+        required: true
+        type: string
+      use_auth:
+        description: 'نیاز به احراز هویت دارد؟'
+        required: true
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+      output_folder:
+        description: 'پوشه خروجی (همان پوشه قبلی)'
+        required: false
+        type: string
+        default: 'downloads/huggingface'
+      skip_download:
+        description: 'رد شدن از دانلود (اگر قبلاً دانلود شده)'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+
+jobs:
+  push-part2:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    
+    - name: Setup Python (if download needed)
+      if: github.event.inputs.skip_download == 'false'
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
+    
+    - name: Install dependencies (if download needed)
+      if: github.event.inputs.skip_download == 'false'
+      run: |
+        pip install huggingface-hub requests tqdm
+    
+    - name: Download model (if needed)
+      if: github.event.inputs.skip_download == 'false'
+      env:
+        HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      run: |
+        import os
+        import re
+        from huggingface_hub import hf_hub_download, login
+        
+        model_url = "${{ github.event.inputs.model_url }}"
+        filename = "${{ github.event.inputs.filename }}"
+        use_auth = "${{ github.event.inputs.use_auth }}" == "true"
+        output_folder = "${{ github.event.inputs.output_folder }}"
+        
+        repo_id = model_url.replace('https://huggingface.co/', '').replace('http://huggingface.co/', '')
+        repo_id = repo_id.rstrip('/')
+        repo_id = re.sub(r'/(resolve|blob)/main.*$', '', repo_id)
+        
+        os.makedirs(output_folder, exist_ok=True)
+        
+        token = os.environ.get('HF_TOKEN') if use_auth else None
+        if use_auth and token:
+            login(token=token, add_to_git_credential=False)
+        
+        downloaded_path = hf_hub_download(
+            repo_id=repo_id,
+            filename=filename,
+            token=token,
+            local_dir=output_folder,
+            local_dir_use_symlinks=False
+        )
+        
+        print(f"✓ Downloaded: {downloaded_path}")
+        
+      shell: python
+    
+    - name: Split and keep only parts 16-31
+      if: github.event.inputs.skip_download == 'false'
+      run: |
+        cd "${{ github.event.inputs.output_folder }}"
+        
+        FILE="${{ github.event.inputs.filename }}"
+        
+        # Split if original file exists
+        if [ -f "$FILE" ]; then
+          # Remove old part files if they exist
+          rm -f ${FILE}.part_* 2>/dev/null
+          
+          # Split into 95MB parts
+          split -b 95M -d "$FILE" "${FILE}.part_"
+          
+          # Remove original
+          rm "$FILE"
+        fi
+        
+        # Create directory for part2
+        mkdir -p part2
+        
+        # Move only parts 16 to 31 to part2 directory
+        for i in $(seq -f "%02g" 16 31); do
+          if [ -f "${FILE}.part_$i" ]; then
+            mv "${FILE}.part_$i" "part2/"
+            echo "Moved part_$i to part2/"
+          fi
+        done
+        
+        # Create manifest for part2
+        cat > part2/MANIFEST_PART2.md << EOF
+        # Part 2 Download (Parts 16-31)
+        - Model: ${{ github.event.inputs.model_url }}
+        - File: ${{ github.event.inputs.filename }}
+        - Parts: 16 to 31
+        - Total parts in this batch: $(ls part2/*.part_* 2>/dev/null | wc -l)
+        
+        ## How to reassemble:
+        1. Make sure part1/ directory exists with parts 00-15
+        2. Run the reassemble_complete.sh script in part1/
+        
+        Or manually:
+        cat part1/${FILE}.part_* part2/${FILE}.part_* > ${FILE}
+        EOF
+        
+        echo "✓ Part 2 prepared with parts 16-31"
+        echo "Files in part2:"
+        ls -lh part2/
+        
+      shell: bash
+    
+    - name: Handle case when skip_download is true
+      if: github.event.inputs.skip_download == 'true'
+      run: |
+        cd "${{ github.event.inputs.output_folder }}"
+        
+        echo "Skipping download, using existing split files"
+        
+        # Create part2 directory if needed
+        mkdir -p part2
+        
+        # Move parts 16-31 from current directory to part2
+        FILE="${{ github.event.inputs.filename }}"
+        for i in $(seq -f "%02g" 16 31); do
+          if [ -f "${FILE}.part_$i" ]; then
+            mv "${FILE}.part_$i" "part2/"
+            echo "Moved part_$i to part2/"
+          fi
+        done
+        
+        echo "✓ Part 2 organized"
+        ls -lh part2/
+        
+      shell: bash
+    
+    - name: Commit and push part 2 only
+      run: |
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.github.com"
+        
+        # Add only part2 directory
+        git add "${{ github.event.inputs.output_folder }}/part2"
+        
+        if git diff --staged --quiet; then
+          echo "No changes to commit"
+        else
+          git commit -m "Part 2/2: ${{ github.event.inputs.filename }} (parts 16-31) [skip ci]"
+          git push origin HEAD:main
+          echo "✓ Part 2 pushed successfully"
+        fi
+        
+        # Update the main reassemble script to include both parts
+        git add "${{ github.event.inputs.output_folder }}/reassemble_complete.sh" 2>/dev/null || true
+        git commit -m "Update reassemble script [skip ci]" 2>/dev/null || true
+        git push origin HEAD:main 2>/dev/null || true

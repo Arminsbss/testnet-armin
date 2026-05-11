@@ -1,0 +1,149 @@
+name: Hugging Face Model Downloader
+
+on:
+  workflow_dispatch:
+    inputs:
+      model_url:
+        description: 'آدرس ریپازیتوری مدل'
+        required: true
+        type: string
+      filename:
+        description: 'نام فایل مدل'
+        required: true
+        type: string
+      use_auth:
+        description: 'نیاز به احراز هویت دارد؟'
+        required: true
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+      output_folder:
+        description: 'پوشه خروجی'
+        required: false
+        type: string
+        default: 'downloads/huggingface'
+
+jobs:
+  download-model:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    
+    - name: Setup Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
+    
+    - name: Install dependencies
+      run: |
+        pip install huggingface-hub requests tqdm
+    
+    - name: Download model from Hugging Face
+      env:
+        HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      run: |
+        import os
+        import re
+        import sys
+        from huggingface_hub import hf_hub_download, login
+        
+        model_url = "${{ github.event.inputs.model_url }}"
+        filename = "${{ github.event.inputs.filename }}"
+        use_auth = "${{ github.event.inputs.use_auth }}" == "true"
+        output_folder = "${{ github.event.inputs.output_folder }}"
+        
+        # Extract repo_id from URL
+        repo_id = model_url.replace('https://huggingface.co/', '').replace('http://huggingface.co/', '')
+        repo_id = repo_id.rstrip('/')
+        repo_id = re.sub(r'/(resolve|blob)/main.*$', '', repo_id)
+        
+        print(f"Repository: {repo_id}")
+        print(f"File: {filename}")
+        print(f"Authentication: {use_auth}")
+        
+        # Create output directory
+        os.makedirs(output_folder, exist_ok=True)
+        
+        # Login if authentication is required
+        token = None
+        if use_auth:
+            token = os.environ.get('HF_TOKEN')
+            if token:
+                login(token=token, add_to_git_credential=False)
+                print("✓ Logged in to Hugging Face")
+            else:
+                print("⚠ Warning: use_auth=true but no HF_TOKEN secret found")
+                print("  Please add HF_TOKEN to repository secrets")
+        
+        try:
+            downloaded_path = hf_hub_download(
+                repo_id=repo_id,
+                filename=filename,
+                token=token,
+                local_dir=output_folder,
+                local_dir_use_symlinks=False
+            )
+            print(f"✓ Successfully downloaded to: {downloaded_path}")
+            
+            # Show file size
+            file_size = os.path.getsize(downloaded_path)
+            file_size_mb = file_size / (1024 * 1024)
+            print(f"File size: {file_size_mb:.2f} MB")
+            
+        except Exception as e:
+            print(f"Error: {e}")
+            sys.exit(1)
+            
+      shell: python
+    
+    - name: Split large files (if larger than 95MB)
+      run: |
+        cd "${{ github.event.inputs.output_folder }}"
+        
+        for file in $(find . -type f -size +95M -not -name "*.part*" -not -name "*.md5" -not -name "download_info.txt"); do
+            echo "Splitting: $file ($(stat -c%s $file) bytes)"
+            split -b 95M -d "$file" "${file}.part_"
+            md5sum "$file" > "${file}.md5"
+            rm "$file"
+            echo "✓ Split into $(ls ${file}.part_* | wc -l) parts"
+        done
+        
+        if find . -name "*.part_*" | grep -q .; then
+            cat > reassemble.sh << 'EOF'
+        #!/bin/bash
+        for md5file in $(find . -name "*.md5"); do
+            basefile="${md5file%.md5}"
+            if ls ${basefile}.part_* 1>/dev/null 2>&1; then
+                echo "Reassembling: $basefile"
+                cat ${basefile}.part_* > "${basefile}"
+                if md5sum -c "$md5file" 2>/dev/null; then
+                    echo "✓ Verified - removing parts"
+                    rm ${basefile}.part_* "$md5file"
+                fi
+            fi
+        done
+        EOF
+            chmod +x reassemble.sh
+        fi
+        
+        echo "Files in output folder:"
+        ls -lh
+    
+    - name: Commit and push
+      run: |
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+        git add "${{ github.event.inputs.output_folder }}"
+        if ! git diff --staged --quiet; then
+            git commit -m "Download: ${{ github.event.inputs.filename }} from Hugging Face [skip ci]"
+            git push
+            echo "✓ Successfully pushed to repository"
+        fi
