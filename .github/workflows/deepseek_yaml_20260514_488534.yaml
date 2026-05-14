@@ -1,0 +1,153 @@
+name: Direct Download from URL
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'لینک مستقیم فایل'
+        required: true
+        type: string
+      output_folder:
+        description: 'پوشه خروجی'
+        required: false
+        type: string
+        default: 'downloads'
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    
+    - name: Download file
+      run: |
+        mkdir -p temp_dl
+        cd temp_dl
+        
+        URL="${{ github.event.inputs.url }}"
+        FILENAME=$(basename "$URL" | cut -d '?' -f1)
+        
+        echo "Downloading: $URL"
+        wget --progress=bar:force "$URL" -O "$FILENAME" 2>&1
+        
+        echo "Downloaded file: $FILENAME"
+        ls -lh "$FILENAME"
+        
+        # Get file size in MB
+        FILE_SIZE=$(stat -c%s "$FILENAME")
+        FILE_SIZE_MB=$((FILE_SIZE / 1024 / 1024))
+        echo "File size: ${FILE_SIZE_MB} MB"
+        
+        # Save original filename for later
+        echo "$FILENAME" > original_filename.txt
+        
+      shell: bash
+    
+    - name: Split if larger than 95MB (and remove original)
+      run: |
+        cd temp_dl
+        
+        FILENAME=$(cat original_filename.txt)
+        FILE_SIZE=$(stat -c%s "$FILENAME")
+        MAX_SIZE=$((95 * 1024 * 1024))  # 95MB in bytes
+        
+        if [ $FILE_SIZE -gt $MAX_SIZE ]; then
+          echo "File is larger than 95MB, splitting..."
+          
+          # Split into 95MB parts
+          split -b 95M -d "$FILENAME" "${FILENAME}.part_"
+          
+          # Create checksum file
+          md5sum "$FILENAME" > "${FILENAME}.md5"
+          
+          # Remove the original file (important!)
+          rm "$FILENAME"
+          
+          # Count parts
+          PART_COUNT=$(ls ${FILENAME}.part_* 2>/dev/null | wc -l)
+          echo "✓ Split into ${PART_COUNT} parts (95MB each)"
+          
+          # Create reassemble script
+          cat > reassemble_${FILENAME}.sh << EOF
+          #!/bin/bash
+          # Reassemble script for ${FILENAME}
+          cat ${FILENAME}.part_* > ${FILENAME}
+          md5sum -c ${FILENAME}.md5
+          EOF
+          chmod +x reassemble_${FILENAME}.sh
+          
+          echo "✓ Created reassemble script: reassemble_${FILENAME}.sh"
+        else
+          echo "File is under 95MB, no splitting needed"
+          # Create a simple info file
+          echo "File: ${FILENAME}" > "${FILENAME}.info"
+          echo "Size: ${FILE_SIZE_MB} MB" >> "${FILENAME}.info"
+        fi
+        
+        # List final files (should NOT include original if it was split)
+        echo "Final files in temp_dl:"
+        ls -lh
+        
+      shell: bash
+    
+    - name: Move to downloads folder and commit
+      run: |
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+        
+        # Create downloads directory
+        mkdir -p "${{ github.event.inputs.output_folder }}"
+        
+        # Move all files from temp_dl to downloads (excluding original if exists)
+        cd temp_dl
+        
+        # Remove original filename if it exists (safety check)
+        ORIGINAL_FILE=$(cat original_filename.txt 2>/dev/null)
+        if [ -f "$ORIGINAL_FILE" ] && [ $(stat -c%s "$ORIGINAL_FILE") -gt $((95 * 1024 * 1024)) ]; then
+          echo "WARNING: Original file still exists! Removing it..."
+          rm -f "$ORIGINAL_FILE"
+        fi
+        
+        # Move all remaining files
+        for file in *; do
+          if [ -f "$file" ]; then
+            mv "$file" "../${{ github.event.inputs.output_folder }}/"
+            echo "Moved: $file"
+          fi
+        done
+        
+        cd ..
+        
+        # Add files to git
+        git add "${{ github.event.inputs.output_folder }}/"
+        
+        # Check if there are changes
+        if git diff --staged --quiet; then
+          echo "No changes to commit"
+        else
+          git commit -m "Direct Download: ${{ github.event.inputs.url }} [skip ci]"
+          
+          # Push with retry
+          for i in {1..3}; do
+            if git push; then
+              echo "✓ Successfully pushed"
+              break
+            else
+              echo "Push failed, retrying in 5 seconds... (Attempt $i/3)"
+              sleep 5
+            fi
+          done
+        fi
+        
+        echo ""
+        echo "=== Download Complete ==="
+        echo "Files in ${{ github.event.inputs.output_folder }}:"
+        ls -lh "${{ github.event.inputs.output_folder }}"
+        
+      shell: bash
