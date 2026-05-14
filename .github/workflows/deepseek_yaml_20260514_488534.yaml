@@ -49,7 +49,7 @@ jobs:
         
       shell: bash
     
-    - name: Split if larger than 95MB (and remove original)
+    - name: Split if larger than 95MB
       run: |
         cd temp_dl
         
@@ -73,24 +73,19 @@ jobs:
           PART_COUNT=$(ls ${FILENAME}.part_* 2>/dev/null | wc -l)
           echo "✓ Split into ${PART_COUNT} parts (95MB each)"
           
-          # Create reassemble script
-          cat > reassemble_${FILENAME}.sh << EOF
-          #!/bin/bash
-          # Reassemble script for ${FILENAME}
-          cat ${FILENAME}.part_* > ${FILENAME}
-          md5sum -c ${FILENAME}.md5
-          EOF
+          # Create reassemble script using printf instead of heredoc
+          printf '#!/bin/bash\n' > reassemble_${FILENAME}.sh
+          printf '# Reassemble script for %s\n' "$FILENAME" >> reassemble_${FILENAME}.sh
+          printf 'cat %s.part_* > %s\n' "$FILENAME" "$FILENAME" >> reassemble_${FILENAME}.sh
+          printf 'md5sum -c %s.md5\n' "$FILENAME" >> reassemble_${FILENAME}.sh
+          
           chmod +x reassemble_${FILENAME}.sh
           
           echo "✓ Created reassemble script: reassemble_${FILENAME}.sh"
         else
           echo "File is under 95MB, no splitting needed"
-          # Create a simple info file
-          echo "File: ${FILENAME}" > "${FILENAME}.info"
-          echo "Size: ${FILE_SIZE_MB} MB" >> "${FILENAME}.info"
         fi
         
-        # List final files (should NOT include original if it was split)
         echo "Final files in temp_dl:"
         ls -lh
         
@@ -101,20 +96,11 @@ jobs:
         git config user.name "github-actions[bot]"
         git config user.email "github-actions[bot]@users.noreply.github.com"
         
-        # Create downloads directory
         mkdir -p "${{ github.event.inputs.output_folder }}"
         
-        # Move all files from temp_dl to downloads (excluding original if exists)
         cd temp_dl
         
-        # Remove original filename if it exists (safety check)
-        ORIGINAL_FILE=$(cat original_filename.txt 2>/dev/null)
-        if [ -f "$ORIGINAL_FILE" ] && [ $(stat -c%s "$ORIGINAL_FILE") -gt $((95 * 1024 * 1024)) ]; then
-          echo "WARNING: Original file still exists! Removing it..."
-          rm -f "$ORIGINAL_FILE"
-        fi
-        
-        # Move all remaining files
+        # Move all files to downloads
         for file in *; do
           if [ -f "$file" ]; then
             mv "$file" "../${{ github.event.inputs.output_folder }}/"
@@ -127,14 +113,13 @@ jobs:
         # Add files to git
         git add "${{ github.event.inputs.output_folder }}/"
         
-        # Check if there are changes
         if git diff --staged --quiet; then
           echo "No changes to commit"
         else
           git commit -m "Direct Download: ${{ github.event.inputs.url }} [skip ci]"
           
           # Push with retry
-          for i in {1..3}; do
+          for i in 1 2 3; do
             if git push; then
               echo "✓ Successfully pushed"
               break
