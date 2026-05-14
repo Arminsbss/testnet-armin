@@ -1,16 +1,14 @@
-name: Direct Download from URL
+name: Direct Download (Python)
 
 on:
   workflow_dispatch:
     inputs:
       url:
-        description: 'لینک مستقیم فایل'
+        description: 'Download URL'
         required: true
-        type: string
-      output_folder:
-        description: 'پوشه خروجی'
+      folder:
+        description: 'Output folder'
         required: false
-        type: string
         default: 'downloads'
 
 jobs:
@@ -18,116 +16,61 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-    
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v4
-      with:
-        fetch-depth: 0
-    
-    - name: Download and process with Python
-      run: |
-        python3 << 'PYTHON_CODE'
-        import os
-        import subprocess
-        import urllib.request
-        from urllib.parse import urlparse
-        
-        url = "${{ github.event.inputs.url }}"
-        output_folder = "${{ github.event.inputs.output_folder }}"
-        
-        # Extract filename from URL
-        filename = os.path.basename(urlparse(url).path)
-        if '?' in filename:
-            filename = filename.split('?')[0]
-        
-        print(f"Downloading: {url}")
-        print(f"Filename: {filename}")
-        
-        # Download using wget (more reliable)
-        os.makedirs("temp_dl", exist_ok=True)
-        os.chdir("temp_dl")
-        
-        result = subprocess.run(["wget", url, "-O", filename], capture_output=True, text=True)
-        if result.returncode != 0:
-            print("Download failed!")
-            print(result.stderr)
-            exit(1)
-        
-        # Get file size
-        file_size = os.path.getsize(filename)
-        file_size_mb = file_size / (1024 * 1024)
-        print(f"File size: {file_size_mb:.2f} MB")
-        
-        max_size = 95 * 1024 * 1024  # 95MB
-        
-        if file_size > max_size:
-            print("File larger than 95MB, splitting...")
-            
-            # Split file
-            part_num = 0
-            with open(filename, 'rb') as f:
-                while True:
-                    chunk = f.read(max_size)
-                    if not chunk:
-                        break
-                    part_name = f"{filename}.part_{part_num:02d}"
-                    with open(part_name, 'wb') as part_file:
-                        part_file.write(chunk)
-                    print(f"  Created: {part_name}")
-                    part_num += 1
-            
-            # Create MD5 checksum
-            md5_result = subprocess.run(["md5sum", filename], capture_output=True, text=True)
-            with open(f"{filename}.md5", 'w') as f:
-                f.write(md5_result.stdout)
-            
-            # Remove original file
-            os.remove(filename)
-            print(f"✓ Split into {part_num} parts")
-            
-            # Create reassemble script
-            with open(f"reassemble_{filename}.sh", 'w') as f:
-                f.write("#!/bin/bash\n")
-                f.write(f"# Reassemble script for {filename}\n")
-                f.write(f"cat {filename}.part_* > {filename}\n")
-                f.write(f"md5sum -c {filename}.md5\n")
-                f.write(f"echo 'Done! File: {filename}'\n")
-            
-            os.chmod(f"reassemble_{filename}.sh", 0o755)
-            print(f"✓ Created reassemble_{filename}.sh")
-        else:
-            print("File is under 95MB, no splitting needed")
-        
-        os.chdir("..")
-        print("Done!")
-        PYTHON_CODE
-      shell: bash
-    
-    - name: Move and push to repository
-      run: |
-        git config user.name "github-actions[bot]"
-        git config user.email "github-actions[bot]@users.noreply.github.com"
-        
-        mkdir -p "${{ github.event.inputs.output_folder }}"
-        
-        # Move all files
-        mv temp_dl/* "${{ github.event.inputs.output_folder }}/" 2>/dev/null || true
-        rmdir temp_dl 2>/dev/null || true
-        
-        # Add to git
-        git add "${{ github.event.inputs.output_folder }}/"
-        
-        if git diff --staged --quiet; then
-          echo "No changes to commit"
-        else
-          git commit -m "Direct Download: ${{ github.event.inputs.url }} [skip ci]"
+      - uses: actions/checkout@v4
+      
+      - name: Run Python downloader
+        run: |
+          python3 << PYEOF
+          import os, subprocess, shutil
+          
+          url = "${{ github.event.inputs.url }}"
+          out_folder = "${{ github.event.inputs.folder }}"
+          
+          os.makedirs("temp", exist_ok=True)
+          os.chdir("temp")
+          
+          filename = url.split('/')[-1].split('?')[0]
+          subprocess.run(["wget", url, "-O", filename], check=True)
+          
+          size = os.path.getsize(filename)
+          max_size = 95 * 1024 * 1024
+          
+          if size > max_size:
+              print(f"Splitting {filename} ({size/1024/1024:.1f}MB)")
+              with open(filename, 'rb') as f:
+                  part = 0
+                  while True:
+                      chunk = f.read(max_size)
+                      if not chunk:
+                          break
+                      with open(f"{filename}.part_{part:02d}", 'wb') as pf:
+                          pf.write(chunk)
+                      part += 1
+              
+              subprocess.run(["md5sum", filename], stdout=open(f"{filename}.md5", 'w'))
+              os.remove(filename)
+              
+              with open("reassemble.sh", "w") as sf:
+                  sf.write("#!/bin/bash\n")
+                  sf.write(f"cat {filename}.part_* > {filename}\n")
+                  sf.write(f"md5sum -c {filename}.md5\n")
+              os.chmod("reassemble.sh", 0o755)
+              print(f"Split into {part} parts")
+          
+          os.chdir("..")
+          os.makedirs(out_folder, exist_ok=True)
+          for f in os.listdir("temp"):
+              shutil.move(f"temp/{f}", f"{out_folder}/")
+          os.rmdir("temp")
+          PYEOF
+        shell: bash
+      
+      - name: Push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add "${{ github.event.inputs.folder }}/"
+          git diff --staged --quiet || git commit -m "Download [skip ci]"
           git push
-          echo "✓ Successfully pushed to repository"
-        fi
-        
-        echo ""
-        echo "=== Files in repository ==="
-        ls -lh "${{ github.event.inputs.output_folder }}/"
-        
-      shell: bash
+        shell: bash
