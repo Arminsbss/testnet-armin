@@ -25,7 +25,7 @@ jobs:
       with:
         fetch-depth: 0
     
-    - name: Download file
+    - name: Download and process file
       run: |
         mkdir -p temp_dl
         cd temp_dl
@@ -36,103 +36,90 @@ jobs:
         echo "Downloading: $URL"
         wget --progress=bar:force "$URL" -O "$FILENAME" 2>&1
         
-        echo "Downloaded file: $FILENAME"
-        ls -lh "$FILENAME"
-        
-        # Get file size in MB
         FILE_SIZE=$(stat -c%s "$FILENAME")
         FILE_SIZE_MB=$((FILE_SIZE / 1024 / 1024))
         echo "File size: ${FILE_SIZE_MB} MB"
         
-        # Save original filename for later
-        echo "$FILENAME" > original_filename.txt
+        MAX_SIZE=$((95 * 1024 * 1024))
+        
+        if [ $FILE_SIZE -gt $MAX_SIZE ]; then
+          echo "File larger than 95MB, splitting..."
+          split -b 95M -d "$FILENAME" "${FILENAME}.part_"
+          md5sum "$FILENAME" > "${FILENAME}.md5"
+          rm "$FILENAME"
+          
+          PART_COUNT=$(ls ${FILENAME}.part_* 2>/dev/null | wc -l)
+          echo "✓ Split into ${PART_COUNT} parts"
+        fi
+        
+        cd ..
         
       shell: bash
     
-    - name: Split if larger than 95MB
+    - name: Create reassemble script with Python
       run: |
         cd temp_dl
         
-        FILENAME=$(cat original_filename.txt)
-        FILE_SIZE=$(stat -c%s "$FILENAME")
-        MAX_SIZE=$((95 * 1024 * 1024))  # 95MB in bytes
+        python3 << 'PYTHON_SCRIPT'
+        import os
+        import glob
         
-        if [ $FILE_SIZE -gt $MAX_SIZE ]; then
-          echo "File is larger than 95MB, splitting..."
-          
-          # Split into 95MB parts
-          split -b 95M -d "$FILENAME" "${FILENAME}.part_"
-          
-          # Create checksum file
-          md5sum "$FILENAME" > "${FILENAME}.md5"
-          
-          # Remove the original file (important!)
-          rm "$FILENAME"
-          
-          # Count parts
-          PART_COUNT=$(ls ${FILENAME}.part_* 2>/dev/null | wc -l)
-          echo "✓ Split into ${PART_COUNT} parts (95MB each)"
-          
-          # Create reassemble script using printf instead of heredoc
-          printf '#!/bin/bash\n' > reassemble_${FILENAME}.sh
-          printf '# Reassemble script for %s\n' "$FILENAME" >> reassemble_${FILENAME}.sh
-          printf 'cat %s.part_* > %s\n' "$FILENAME" "$FILENAME" >> reassemble_${FILENAME}.sh
-          printf 'md5sum -c %s.md5\n' "$FILENAME" >> reassemble_${FILENAME}.sh
-          
-          chmod +x reassemble_${FILENAME}.sh
-          
-          echo "✓ Created reassemble script: reassemble_${FILENAME}.sh"
-        else
-          echo "File is under 95MB, no splitting needed"
-        fi
+        # Find the main file (without .part_)
+        part_files = glob.glob("*.part_*")
+        if part_files:
+            # Get base filename
+            base_name = part_files[0].replace(".part_00", "").replace(".part_01", "")
+            base_name = base_name.split(".part_")[0]
+            
+            # Create reassemble script
+            with open(f"reassemble_{base_name}.sh", "w") as f:
+                f.write("#!/bin/bash\n")
+                f.write(f"# Reassemble script for {base_name}\n")
+                f.write(f"cat {base_name}.part_* > {base_name}\n")
+                if os.path.exists(f"{base_name}.md5"):
+                    f.write(f"md5sum -c {base_name}.md5\n")
+                f.write('echo "Done! File: {base_name}"\n')
+            
+            os.chmod(f"reassemble_{base_name}.sh", 0o755)
+            print(f"✓ Created reassemble_{base_name}.sh")
+        else:
+            print("No split files found, skipping reassemble script")
+        PYTHON_SCRIPT
         
-        echo "Final files in temp_dl:"
-        ls -lh
+        cd ..
         
       shell: bash
     
-    - name: Move to downloads folder and commit
+    - name: Move and push to repository
       run: |
         git config user.name "github-actions[bot]"
         git config user.email "github-actions[bot]@users.noreply.github.com"
         
         mkdir -p "${{ github.event.inputs.output_folder }}"
         
+        # Move all files except the original large file
         cd temp_dl
-        
-        # Move all files to downloads
         for file in *; do
           if [ -f "$file" ]; then
+            # Skip if it's the original large file (should already be deleted)
             mv "$file" "../${{ github.event.inputs.output_folder }}/"
             echo "Moved: $file"
           fi
         done
-        
         cd ..
         
-        # Add files to git
         git add "${{ github.event.inputs.output_folder }}/"
         
         if git diff --staged --quiet; then
           echo "No changes to commit"
         else
           git commit -m "Direct Download: ${{ github.event.inputs.url }} [skip ci]"
-          
-          # Push with retry
-          for i in 1 2 3; do
-            if git push; then
-              echo "✓ Successfully pushed"
-              break
-            else
-              echo "Push failed, retrying in 5 seconds... (Attempt $i/3)"
-              sleep 5
-            fi
-          done
+          git push
+          echo "✓ Successfully pushed"
         fi
         
         echo ""
-        echo "=== Download Complete ==="
-        echo "Files in ${{ github.event.inputs.output_folder }}:"
-        ls -lh "${{ github.event.inputs.output_folder }}"
+        echo "=== Files in repository ==="
+        ls -lh "${{ github.event.inputs.output_folder }}/"
         
       shell: bash
