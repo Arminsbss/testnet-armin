@@ -25,69 +25,83 @@ jobs:
       with:
         fetch-depth: 0
     
-    - name: Download and process file
+    - name: Download and process with Python
       run: |
-        mkdir -p temp_dl
-        cd temp_dl
-        
-        URL="${{ github.event.inputs.url }}"
-        FILENAME=$(basename "$URL" | cut -d '?' -f1)
-        
-        echo "Downloading: $URL"
-        wget --progress=bar:force "$URL" -O "$FILENAME" 2>&1
-        
-        FILE_SIZE=$(stat -c%s "$FILENAME")
-        FILE_SIZE_MB=$((FILE_SIZE / 1024 / 1024))
-        echo "File size: ${FILE_SIZE_MB} MB"
-        
-        MAX_SIZE=$((95 * 1024 * 1024))
-        
-        if [ $FILE_SIZE -gt $MAX_SIZE ]; then
-          echo "File larger than 95MB, splitting..."
-          split -b 95M -d "$FILENAME" "${FILENAME}.part_"
-          md5sum "$FILENAME" > "${FILENAME}.md5"
-          rm "$FILENAME"
-          
-          PART_COUNT=$(ls ${FILENAME}.part_* 2>/dev/null | wc -l)
-          echo "✓ Split into ${PART_COUNT} parts"
-        fi
-        
-        cd ..
-        
-      shell: bash
-    
-    - name: Create reassemble script with Python
-      run: |
-        cd temp_dl
-        
-        python3 << 'PYTHON_SCRIPT'
+        python3 << 'PYTHON_CODE'
         import os
-        import glob
+        import subprocess
+        import urllib.request
+        from urllib.parse import urlparse
         
-        # Find the main file (without .part_)
-        part_files = glob.glob("*.part_*")
-        if part_files:
-            # Get base filename
-            base_name = part_files[0].replace(".part_00", "").replace(".part_01", "")
-            base_name = base_name.split(".part_")[0]
+        url = "${{ github.event.inputs.url }}"
+        output_folder = "${{ github.event.inputs.output_folder }}"
+        
+        # Extract filename from URL
+        filename = os.path.basename(urlparse(url).path)
+        if '?' in filename:
+            filename = filename.split('?')[0]
+        
+        print(f"Downloading: {url}")
+        print(f"Filename: {filename}")
+        
+        # Download using wget (more reliable)
+        os.makedirs("temp_dl", exist_ok=True)
+        os.chdir("temp_dl")
+        
+        result = subprocess.run(["wget", url, "-O", filename], capture_output=True, text=True)
+        if result.returncode != 0:
+            print("Download failed!")
+            print(result.stderr)
+            exit(1)
+        
+        # Get file size
+        file_size = os.path.getsize(filename)
+        file_size_mb = file_size / (1024 * 1024)
+        print(f"File size: {file_size_mb:.2f} MB")
+        
+        max_size = 95 * 1024 * 1024  # 95MB
+        
+        if file_size > max_size:
+            print("File larger than 95MB, splitting...")
+            
+            # Split file
+            part_num = 0
+            with open(filename, 'rb') as f:
+                while True:
+                    chunk = f.read(max_size)
+                    if not chunk:
+                        break
+                    part_name = f"{filename}.part_{part_num:02d}"
+                    with open(part_name, 'wb') as part_file:
+                        part_file.write(chunk)
+                    print(f"  Created: {part_name}")
+                    part_num += 1
+            
+            # Create MD5 checksum
+            md5_result = subprocess.run(["md5sum", filename], capture_output=True, text=True)
+            with open(f"{filename}.md5", 'w') as f:
+                f.write(md5_result.stdout)
+            
+            # Remove original file
+            os.remove(filename)
+            print(f"✓ Split into {part_num} parts")
             
             # Create reassemble script
-            with open(f"reassemble_{base_name}.sh", "w") as f:
+            with open(f"reassemble_{filename}.sh", 'w') as f:
                 f.write("#!/bin/bash\n")
-                f.write(f"# Reassemble script for {base_name}\n")
-                f.write(f"cat {base_name}.part_* > {base_name}\n")
-                if os.path.exists(f"{base_name}.md5"):
-                    f.write(f"md5sum -c {base_name}.md5\n")
-                f.write('echo "Done! File: {base_name}"\n')
+                f.write(f"# Reassemble script for {filename}\n")
+                f.write(f"cat {filename}.part_* > {filename}\n")
+                f.write(f"md5sum -c {filename}.md5\n")
+                f.write(f"echo 'Done! File: {filename}'\n")
             
-            os.chmod(f"reassemble_{base_name}.sh", 0o755)
-            print(f"✓ Created reassemble_{base_name}.sh")
+            os.chmod(f"reassemble_{filename}.sh", 0o755)
+            print(f"✓ Created reassemble_{filename}.sh")
         else:
-            print("No split files found, skipping reassemble script")
-        PYTHON_SCRIPT
+            print("File is under 95MB, no splitting needed")
         
-        cd ..
-        
+        os.chdir("..")
+        print("Done!")
+        PYTHON_CODE
       shell: bash
     
     - name: Move and push to repository
@@ -97,17 +111,11 @@ jobs:
         
         mkdir -p "${{ github.event.inputs.output_folder }}"
         
-        # Move all files except the original large file
-        cd temp_dl
-        for file in *; do
-          if [ -f "$file" ]; then
-            # Skip if it's the original large file (should already be deleted)
-            mv "$file" "../${{ github.event.inputs.output_folder }}/"
-            echo "Moved: $file"
-          fi
-        done
-        cd ..
+        # Move all files
+        mv temp_dl/* "${{ github.event.inputs.output_folder }}/" 2>/dev/null || true
+        rmdir temp_dl 2>/dev/null || true
         
+        # Add to git
         git add "${{ github.event.inputs.output_folder }}/"
         
         if git diff --staged --quiet; then
@@ -115,7 +123,7 @@ jobs:
         else
           git commit -m "Direct Download: ${{ github.event.inputs.url }} [skip ci]"
           git push
-          echo "✓ Successfully pushed"
+          echo "✓ Successfully pushed to repository"
         fi
         
         echo ""
